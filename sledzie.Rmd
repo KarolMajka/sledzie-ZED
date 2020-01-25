@@ -1,0 +1,296 @@
+---
+title: "Analiza połowu śledzia oceanicznego w Europie"
+author: "Karol Majka"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+always_allow_html: yes
+output:
+  html_document:
+    depth: 2
+    highlight: tango
+    number_sections: yes
+    theme: united
+    toc: yes
+  md_document:
+    toc: yes
+    toc_depth: 2
+    variant: markdown_github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+# Wstęp
+
+Celem projektu jest analiza zbioru danych dotyczących połowu śledzia oceanicznego w Europie oraz próba określenia głównych przyczyn stopniowego zmniejszania się długości śledzi. Pomiary zawierają obserwacje z ostatnich 60 lat. Wiersze są uporządkowane chronologicznie.
+
+Zbiór danych zawiera 52582 obserwacji opisanych 16 cechami. 
+
+# Podsumowanie analizy
+
+Podczas analizy, ze zbioru, usunięte zostały wartości brakujące. Usnięcie wartości pustych zostało dokonane częściowo poprzez wyliczenie miedany ze zbioru podobnego, a tam gdzie nie udało się znaleźć takiego zbioru całe z dalszej analizy został wykreślony cały wiersz. Przeprowadzona została interpretacja wartości cech i korelacji między nimi. W trakcie badań zależności określono, że długość śledzia jest powiązana w dużym stopniu ze zmianą temperatury przy powierzchni wody. W kolejnym kroku utworzony został model predykcji długości ryby w postaci regresora za pomocą algorytmu RandomForest. W projekcie zbadano ważność atrybutów podczas predykcji, co pomogło określić przyczyny spadku długości śledzia wyławianego w Europie:
+
+* wzrost temperatury przy powierzchni wody
+* spadek liczby widłonogów
+
+# Przygotowanie bibliotek i danych
+
+
+W tej części następuje załadowanie wykorzystanych w projekcie bibliotek i wczytanie danych
+
+## Wczytanie bibliotek
+
+```{r library, error=FALSE, warning=FALSE, message=FALSE}
+library(knitr)       # report generation
+library(dplyr)       # data manipulation
+library(ggplot2)     # plots visualisation
+library(gridExtra)   # multiple plots on grid
+library(ggcorrplot)  # correlation matrix visualisation
+library(plotly)      # interactive plots
+library(caret)       # data exploration lib
+library(randomForest)# rf
+library(tidyr)
+```
+
+## Zapewnienie powtarzalności wyników
+
+```{r setSeed}
+set.seed(69)
+```
+
+## Wczytanie danych
+
+```{r loadData}
+sledzie <- read.csv("sledzie.csv", na.strings = "?")
+```
+
+## Opis wczytanych atrybutów
+
+Nazwa atrybutu| Opis
+---------|--------------------------------------------
+length        | długość złowionego śledzia [cm]
+cfin1         | dostępność planktonu [zagęszczenie Calanus finmarchicus gat. 1]
+cfin2         | dostępność planktonu [zagęszczenie Calanus finmarchicus gat. 2]
+chel1         | dostępność planktonu [zagęszczenie Calanus helgolandicus gat. 1]
+chel2         | dostępność planktonu [zagęszczenie Calanus helgolandicus gat. 2]
+lcop1         | dostępność planktonu [zagęszczenie widłonogów  gat. 1]
+lcop2         | dostępność planktonu [zagęszczenie widłonogów  gat. 2]
+fbar          | natężenie połowów w regionie [ułamek pozostawionego narybku]
+recr          | roczny narybek [liczba śledzi]
+cumf          | łączne roczne natężenie połowów w regionie [ułamek pozostawionego narybku]
+totaln        | łączna liczba ryb złowionych w ramach połowu [liczba śledzi]
+sst           | temperatura przy powierzchni wody [°C]
+sal           | poziom zasolenia wody [Knudsen ppt]
+xmonth        | miesiąc połowu [numer miesiąca]
+nao           | oscylacja północnoatlantycka [mb]
+
+# Analiza rozkładu atrybutów
+
+```{r dataSummary}
+summary(sledzie[-1])
+```
+
+# Uzupełnienie pustych danych
+
+```{r NACount, echo=FALSE}
+allRows <- nrow(sledzie)
+completeRows <- sum(complete.cases(sledzie))
+rowsWithNA <- allRows - completeRows
+```
+
+Zbiór danych opisujący połów śledzi zawiera `r rowsWithNA` niepełnych obserwacji. Cały zbiór składa się z `r allRows` pomiarów. W przypadku jeśli odrzucenia wszystkich niepełnych pomiarów utracilibyśmy zbyt dużo istotnych informacji.
+
+Na podstawie wstępnej analizy atrybutów można zauważyć, że brakujące wartości występują w cechach opisujących:
+
+* dostępność planktonu (cfin1, cfin2, chel1, chel2, lcop1, lcop2),
+* temperaturę przy powierzchni wody (sst).
+
+W zbiorze danych można zauważyć, że wartości atrybutów często występują w podobnych grupach.
+W zbiorze danych warto zwrócić uwagę, że wartości atrybutów najczęściej występują w podobnych grupach. Dla przedstawienia tej zależności wybrano przykładowe trzy podzbiory sąsiadujących ze sobą elementów:
+
+```{r similarGroups}
+sledzie[c(1:8, 200:215), ]
+```
+
+Założyć można, że brakujące elementy mają zawsze taką samą wartość jak sąsiadujące obok wiersze.
+
+Dlatego do uzupełnienia wartości pustych w wierszach zostanie użyty algorytm sprawdzający podobieństwo wierszy. Następnie po znalezieniu podobnych wierszy wartość pusta zostanie uzupełniona medianą znalezionych wierszy.
+
+Dla wierszy gdzie nie udało się znaleźć podobieństw zostaną one usunięte z dalszej analizy.
+
+```{r fillMissing, error=FALSE, message=FALSE, cache=TRUE}
+sledzieFilled <- sledzie
+
+planktonAttributesNames <- c("cfin1", "cfin2", "chel1", "chel2", "lcop1", "lcop2")
+missingAttributes <- c(planktonAttributesNames, "sst")
+
+for (missingValue in missingAttributes) {
+  df <- sledzie[is.na(sledzie[[missingValue]]), ]
+  if (nrow(df) == 0) { next }
+  planktonAttributesToFilter <- planktonAttributesNames[planktonAttributesNames != missingValue]
+
+  for(i in 1:nrow(df)) {
+    row <- df[i,]
+
+    if (missingValue == "sst") {
+      similarGroups <- sledzie[
+        sledzie$totaln == row$totaln &
+        sledzie$sal == row$sal &
+        sledzie$xmonth == row$xmonth &
+        sledzie$nao == row$nao, ]
+    } else {
+      similarGroups <- sledzie[
+        sledzie[[planktonAttributesToFilter[1]]] == row[[planktonAttributesToFilter[1]]] &
+        sledzie[[planktonAttributesToFilter[2]]] == row[[planktonAttributesToFilter[2]]] &
+        sledzie[[planktonAttributesToFilter[3]]] == row[[planktonAttributesToFilter[3]]] &
+        sledzie[[planktonAttributesToFilter[4]]] == row[[planktonAttributesToFilter[4]]] &
+        sledzie[[planktonAttributesToFilter[5]]] == row[[planktonAttributesToFilter[5]]]
+        , ]
+    }
+    sledzieFilled[sledzieFilled$X == row$X,][[missingValue]] <- median(similarGroups[[missingValue]], na.rm = TRUE)
+  }
+}
+
+sledzieFilled <- sledzieFilled[complete.cases(sledzieFilled), ]
+```
+
+## Analiza rozkładu atrybutów
+
+```{r filledDataSummary}
+summary(sledzieFilled[-1])
+```
+
+## Analiza rozkładu wartości atrybutów
+
+```{r SimplePlots, echo=FALSE, error=F, message=FALSE}
+sledzieValues <- sledzieFilled[,!(names(sledzieFilled) %in% c("X", "xmonth"))]
+color = "#56B4E9"
+
+sledzieValues[,(names(sledzieValues) %in% planktonAttributesNames)] %>%
+  gather() %>% 
+  ggplot(aes(value)) +
+  facet_wrap(~ key, scales = "free") +
+  geom_histogram(color=color, fill=color) + 
+  theme_bw()
+
+sledzieValues[,(!(names(sledzieValues) %in% planktonAttributesNames))] %>%
+  gather() %>% 
+  ggplot(aes(value)) +
+  facet_wrap(~ key, scales = "free") +
+  geom_histogram(color=color, fill=color) + 
+  theme_bw()
+
+```
+
+# Analiza korelacji atrybutów
+
+```{r corAnalysis}
+corMatrix <- cor(sledzieFilled[, -1])
+ggcorrplot(corMatrix,  type = "lower", outline.col = "white") + ggtitle("Korelacja atrybutów")
+```
+
+Na wykresie można zauważyć silną korelację ujemną między długością śledzia (length), a temperaturą przy powierzchni (sst).
+
+
+```{r feature2, message = FALSE}
+ggplot(sledzieFilled, aes(x=sst, y=length)) + 
+  ggtitle("Zmiana długości złowionego śledzia w zależności od temperatory przy powierzchni wody") + 
+  geom_smooth() + 
+  theme_bw()
+```
+
+# Prezentacja interaktywnego wykresu zmiany długości złowionego śledzia w czasie
+
+```{r plotlyLength, message = FALSE}
+partition <- createDataPartition(y=sledzieFilled$length, p=.05, list=FALSE)
+dfPartition <- sledzieFilled[partition, ]
+p <- ggplot(dfPartition, aes(x=X, y=length)) + 
+  ggtitle("Zmiana długości złowionego śledzia w czasie") + 
+  geom_smooth() + 
+  theme_bw()
+ggplotly(p)
+```
+
+# Regresor przewidujący długość złowionego śledzia
+
+
+```{r regression, cache=TRUE, error=FALSE, warning=FALSE, message=FALSE}
+# learn = 80%, test = 20%
+regPartition <- createDataPartition(y=sledzieValues$length, p=0.8, list=FALSE)
+train <- sledzieValues[regPartition, ]
+test <- sledzieValues[-regPartition, ]
+
+rfGrid <- expand.grid(mtry = 1:6)
+
+ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 2)
+#uczenie
+fit <- train(length ~ .,
+             data = train,
+             method = 'rf',
+             trControl = ctrl,
+             metric = "RMSE",
+             tuneGrid=rfGrid,
+             importance = TRUE,
+             ntree=18)
+ggplot(fit) + 
+  ggtitle("Optymalizacja parametru mtry na podstawie miary RMSE") + 
+  theme_bw()
+```
+
+
+Testowanie modelu
+
+```{r testTrainModel}
+predictions <- predict(fit, newdata = test[-1])
+modelValues <- data.frame(obs = test$length, pred = predictions)
+kable(defaultSummary(modelValues))
+```
+
+# Analiza ważności atrybutów
+
+```{r variableImportance}
+importance <- varImp(fit, scale = FALSE)
+ggplot(importance) + 
+  theme_bw() +
+  ggtitle("Ważność atrybutów w stosunku do atrybutu length")
+```
+
+Analiza ważności atrybutów wskazuje, że najważniejszym atrybutem podczas predykcji była temperatura przy powierzchni wody (sst).
+
+
+```{r plotsComparison, message=FALSE}
+
+maxValueIndex <- 17000
+
+ggplot(data= sledzieFilled, aes(x=X,y=length)) + 
+  geom_vline(xintercept = maxValueIndex, color="orange", linetype = "longdash", size = 1) + 
+  geom_smooth() + 
+  ggtitle("Zmiana długości złowionego śledzia w czasie") + 
+  theme_bw()
+
+ggplot(data= sledzieFilled, aes(x=X,y=sst)) + 
+  geom_vline(xintercept = maxValueIndex, color="orange", linetype = "longdash", size = 1) + 
+  geom_smooth() + 
+  ggtitle("Zmiana temperatury przy powierzchni wody w czasie") + 
+  theme_bw()
+
+ggplot(data= sledzieFilled, aes(x=X,y=lcop1)) + 
+  geom_vline(xintercept = maxValueIndex, color="orange", linetype = "longdash", size = 1) + 
+  geom_smooth() + 
+  ggtitle("Zmiana liczby widłonogów gat. 1 w czasie") + 
+  theme_bw()
+
+ggplot(data= sledzieFilled, aes(x=X,y=lcop2)) + 
+  geom_vline(xintercept = maxValueIndex, color="orange", linetype = "longdash", size = 1) + 
+  geom_smooth() + 
+  ggtitle("Zmiana liczby widłonogów gat. 2 w czasie") + 
+  theme_bw()
+
+```
+
+# Wnioski
+
+Na podstawie powyższych badań można zauważyć, że najważniejszym czynnikiem na wpływającym długość złowionego śledzi jest temperatura przy powierzchni wody.
+
+Nie wyklucza to wpływu również innych czynników, które mogły zaważyć na długości złowionego śledzia. W analizie korelacji było można zauważyć również inne silne korelacje, które należałoby zbadać dokładniej, aby wyciągnąć bardziej trafne wnioski.
+

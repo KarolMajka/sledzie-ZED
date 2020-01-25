@@ -1,0 +1,11 @@
+base
+knitr
+dplyr
+ggplot2
+gridExtra
+ggcorrplot
+plotly
+lattice
+caret
+randomForest
+tidyr
